@@ -34,7 +34,7 @@ struct Args {
     motion_threshold: u16,
 
     /// Rolling window (ms) for evaluating motion ratio
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 100)]
     activation_window_ms: u64,
 
     /// Required percentage (0-100) of motion-positive samples in the window
