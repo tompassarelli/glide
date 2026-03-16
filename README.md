@@ -15,7 +15,7 @@ The detection algorithm uses a consecutive motion streak: the finger must show c
 
 ## Installation
 
-### Non-Nix Linux
+### Linux (most distros)
 
 ```bash
 # Build
