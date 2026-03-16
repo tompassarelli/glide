@@ -23,17 +23,17 @@ git clone https://github.com/tompassarelli/glide
 cd glide
 cargo build --release
 
-# Run (needs root for evdev access)
-sudo ./target/release/glide \
-  --device /dev/input/by-path/your-touchpad-event-mouse \
-  --kanata-address 127.0.0.1:7070 \
-  --virtual-key pad-touch
+# Find your touchpad
+sudo ./target/release/glide --list-devices
+
+# Run (auto-detects touchpad if only one is present)
+sudo ./target/release/glide
+
+# Or specify explicitly
+sudo ./target/release/glide --device /dev/input/eventX
 ```
 
-Find your touchpad device:
-```bash
-ls /dev/input/by-path/ | grep mouse
-```
+If `--list-devices` shows nothing, make sure you have permission to read `/dev/input/event*` (run with sudo or add your user to the `input` group).
 
 ### NixOS (flake)
 
@@ -87,7 +87,8 @@ In your kanata config:
 ## CLI options
 
 ```
---device              Touchpad evdev path (default: platform-AMDI0010:03-event-mouse)
+--list-devices        List detected touchpad devices and exit
+--device              Touchpad evdev path (auto-detects if omitted)
 --kanata-address      Kanata TCP address (default: 127.0.0.1:7070)
 --virtual-key         Virtual key name (default: pad-touch)
 --motion-threshold    Min displacement per sample to count as motion (default: 2)

@@ -1,5 +1,6 @@
 mod algorithm;
 mod backend;
+mod detect;
 mod episode;
 mod keyboard;
 mod record;
@@ -24,13 +25,13 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(name = "glide")]
 struct Args {
-    /// Touchpad evdev device path
-    #[arg(
-        short = 'd',
-        long,
-        default_value = "/dev/input/by-path/platform-AMDI0010:03-event-mouse"
-    )]
-    device: String,
+    /// Touchpad evdev device path. If omitted, auto-detects.
+    #[arg(short = 'd', long)]
+    device: Option<String>,
+
+    /// List detected touchpad devices and exit.
+    #[arg(long)]
+    list_devices: bool,
 
     /// Kanata TCP server address (ip:port)
     #[arg(short = 'a', long, default_value = "127.0.0.1:7070")]
@@ -81,12 +82,23 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    if args.list_devices {
+        detect::list_devices();
+        return Ok(());
+    }
+
     info!("glide starting");
-    info!("device: {}", args.device);
+
+    let device_path = match args.device {
+        Some(ref path) => path.clone(),
+        None => detect::autodetect()?,
+    };
+
+    info!("device: {}", device_path);
     info!("motion threshold: {}", args.motion_threshold);
 
-    let mut device = Device::open(&args.device)
-        .with_context(|| format!("failed to open touchpad device '{}'", args.device))?;
+    let mut device = Device::open(&device_path)
+        .with_context(|| format!("failed to open touchpad device '{}'", device_path))?;
 
     info!(
         "opened touchpad: {:?} (not grabbed)",
@@ -145,7 +157,7 @@ fn main() -> Result<()> {
             min_streak: if args.algorithm == "streak" { Some(args.min_streak) } else { None },
             activation_window_ms: if args.algorithm == "window" { Some(args.activation_window_ms) } else { None },
             activation_ratio: if args.algorithm == "window" { Some(args.activation_ratio) } else { None },
-            device: args.device.clone(),
+            device: device_path.clone(),
             keyboard_device: args.keyboard_device.clone(),
         });
         None
