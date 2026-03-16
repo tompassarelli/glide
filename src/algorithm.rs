@@ -18,6 +18,8 @@ pub trait ActivationAlgorithm {
     /// Current motion ratio in the rolling window, if applicable.
     fn current_motion_ratio(&self) -> Option<f64>;
     fn is_active(&self) -> bool;
+    /// Name of the algorithm, for logging.
+    fn name(&self) -> &'static str;
 }
 
 /// Rolling window algorithm: counts motion-positive samples within a time
@@ -117,5 +119,108 @@ impl ActivationAlgorithm for RollingWindowAlgorithm {
 
     fn is_active(&self) -> bool {
         self.is_active
+    }
+
+    fn name(&self) -> &'static str {
+        "rolling_window"
+    }
+}
+
+/// Experimental: Consecutive motion streak algorithm.
+///
+/// Activates when min_streak consecutive motion-positive samples are observed.
+/// Based on labeled data showing that the longest consecutive motion run
+/// cleanly separates intentional (min 19) from accidental (max 13) episodes.
+///
+/// Deactivation is governed separately: once active, stays active until
+/// finger-up. A future improvement may add a release timeout or an
+/// inactive-streak rule, but finger-up is the correct first approximation
+/// since the touchpad drives a layer-while-held virtual key.
+///
+/// NOTE: This is calibrated against one user's dataset on one touchpad
+/// (Framework 13, PIXA3854). The min_streak default of 16 should be
+/// re-evaluated with more data before treating it as universal.
+pub struct ConsecutiveStreakAlgorithm {
+    is_active: bool,
+    motion_threshold_sq: i32,
+    min_streak: u32,
+    current_streak: u32,
+}
+
+impl ConsecutiveStreakAlgorithm {
+    pub fn new(motion_threshold: u16, min_streak: u32) -> Self {
+        let t = i32::from(motion_threshold);
+        Self {
+            is_active: false,
+            motion_threshold_sq: t * t,
+            min_streak,
+            current_streak: 0,
+        }
+    }
+}
+
+impl ActivationAlgorithm for ConsecutiveStreakAlgorithm {
+    fn on_finger_down(&mut self) {
+        self.current_streak = 0;
+    }
+
+    fn on_finger_up(&mut self) -> Option<GlideState> {
+        self.current_streak = 0;
+        if self.is_active {
+            self.is_active = false;
+            Some(GlideState::Inactive)
+        } else {
+            None
+        }
+    }
+
+    fn on_sample(&mut self, sample: &Sample) -> Option<GlideState> {
+        if self.is_active {
+            return None;
+        }
+
+        let dist_sq = sample.dx * sample.dx + sample.dy * sample.dy;
+        let is_motion = dist_sq >= self.motion_threshold_sq;
+
+        if is_motion {
+            self.current_streak += 1;
+            if self.current_streak >= self.min_streak {
+                self.is_active = true;
+                log::info!(
+                    "streak algorithm: activated after {} consecutive motion samples (~{}ms)",
+                    self.current_streak,
+                    self.current_streak * 7, // approximate at ~7ms/sample
+                );
+                return Some(GlideState::Active);
+            }
+        } else {
+            if self.current_streak > 0 {
+                log::trace!(
+                    "streak algorithm: streak broken at {} (needed {})",
+                    self.current_streak,
+                    self.min_streak,
+                );
+            }
+            self.current_streak = 0;
+        }
+
+        None
+    }
+
+    fn current_motion_ratio(&self) -> Option<f64> {
+        // Not meaningful for streak algorithm, but return streak progress
+        if self.min_streak > 0 {
+            Some(self.current_streak as f64 / self.min_streak as f64)
+        } else {
+            None
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.is_active
+    }
+
+    fn name(&self) -> &'static str {
+        "consecutive_streak"
     }
 }

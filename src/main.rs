@@ -5,7 +5,9 @@ mod keyboard;
 mod record;
 mod sampler;
 
-use algorithm::{ActivationAlgorithm, GlideState, RollingWindowAlgorithm};
+use algorithm::{
+    ActivationAlgorithm, ConsecutiveStreakAlgorithm, GlideState, RollingWindowAlgorithm,
+};
 use anyhow::{Context, Result, bail};
 use backend::{Backend, KanataClient};
 use clap::Parser;
@@ -50,6 +52,16 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     activation_ratio: u16,
 
+    /// Activation algorithm: "streak" (default, experimental) or "window" (rolling window).
+    #[arg(long, default_value = "streak")]
+    algorithm: String,
+
+    /// [streak] Minimum consecutive motion-positive samples to activate.
+    /// At ~7ms/sample, 16 ≈ 112ms. Based on labeled data where intentional
+    /// episodes had min streak 19 and accidental had max streak 13.
+    #[arg(long, default_value_t = 16)]
+    min_streak: u32,
+
     /// Record JSONL trace data to stdout for offline analysis.
     /// Disables the kanata backend.
     #[arg(long)]
@@ -71,10 +83,7 @@ fn main() -> Result<()> {
 
     info!("glide starting");
     info!("device: {}", args.device);
-    info!(
-        "detection: threshold={} window={}ms ratio={}%",
-        args.motion_threshold, args.activation_window_ms, args.activation_ratio
-    );
+    info!("motion threshold: {}", args.motion_threshold);
 
     let mut device = Device::open(&args.device)
         .with_context(|| format!("failed to open touchpad device '{}'", args.device))?;
@@ -95,13 +104,32 @@ fn main() -> Result<()> {
     });
 
     let mut sampler = TouchpadSampler::new();
-    let mut algorithm: Box<dyn ActivationAlgorithm> = Box::new(
-        RollingWindowAlgorithm::new(
-            args.motion_threshold,
-            args.activation_window_ms,
-            args.activation_ratio,
-        ),
-    );
+    let mut algorithm: Box<dyn ActivationAlgorithm> = match args.algorithm.as_str() {
+        "streak" => {
+            info!(
+                "algorithm: consecutive_streak (min_streak={}, threshold={})",
+                args.min_streak, args.motion_threshold
+            );
+            Box::new(ConsecutiveStreakAlgorithm::new(
+                args.motion_threshold,
+                args.min_streak,
+            ))
+        }
+        "window" => {
+            info!(
+                "algorithm: rolling_window (threshold={}, window={}ms, ratio={}%)",
+                args.motion_threshold, args.activation_window_ms, args.activation_ratio
+            );
+            Box::new(RollingWindowAlgorithm::new(
+                args.motion_threshold,
+                args.activation_window_ms,
+                args.activation_ratio,
+            ))
+        }
+        other => {
+            anyhow::bail!("unknown algorithm '{other}', expected 'streak' or 'window'");
+        }
+    };
     let mut episodes = EpisodeTracker::new(args.motion_threshold);
 
     let recording = args.record;
@@ -112,9 +140,11 @@ fn main() -> Result<()> {
         writer.emit(&Record::SessionStart {
             timestamp_ms: 0.0,
             label: args.label.clone(),
+            algorithm: algorithm.name().to_string(),
             motion_threshold: args.motion_threshold,
-            activation_window_ms: args.activation_window_ms,
-            activation_ratio: args.activation_ratio,
+            min_streak: if args.algorithm == "streak" { Some(args.min_streak) } else { None },
+            activation_window_ms: if args.algorithm == "window" { Some(args.activation_window_ms) } else { None },
+            activation_ratio: if args.algorithm == "window" { Some(args.activation_ratio) } else { None },
             device: args.device.clone(),
             keyboard_device: args.keyboard_device.clone(),
         });

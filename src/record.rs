@@ -8,9 +8,11 @@ pub enum Record {
     SessionStart {
         timestamp_ms: f64,
         label: Option<String>,
+        algorithm: String,
         motion_threshold: u16,
-        activation_window_ms: u64,
-        activation_ratio: u16,
+        min_streak: Option<u32>,
+        activation_window_ms: Option<u64>,
+        activation_ratio: Option<u16>,
         device: String,
         keyboard_device: Option<String>,
     },
