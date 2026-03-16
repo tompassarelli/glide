@@ -42,54 +42,187 @@ struct Args {
     activation_ratio: u16,
 
     /// Log mode: dump CSV sample data for training/analysis instead of connecting to kanata.
-    /// Label sessions by pressing Enter and typing a label (e.g. "intentional", "accidental").
     #[arg(long)]
     log_samples: bool,
 }
 
-/// Internal state change from the motion detector.
+// =============================================================================
+// Layer 1: Sampling — reads evdev, produces touchpad events
+// =============================================================================
+
+/// A raw sample from the touchpad: position + displacement since last sample.
+#[derive(Debug, Clone)]
+struct Sample {
+    timestamp: Instant,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    displacement: f64,
+}
+
+/// Events produced by the sampler.
+enum TouchpadEvent {
+    FingerDown,
+    FingerUp,
+    Position(Sample),
+}
+
+/// Reads evdev events and produces a stream of TouchpadEvents.
+/// Knows nothing about activation logic.
+struct TouchpadSampler {
+    finger_down: bool,
+    last_pos: Option<(i32, i32)>,
+}
+
+impl TouchpadSampler {
+    fn new() -> Self {
+        Self {
+            finger_down: false,
+            last_pos: None,
+        }
+    }
+
+    /// Process a batch of evdev events into touchpad events.
+    fn process_events(&mut self, raw_events: &[evdev::InputEvent]) -> Vec<TouchpadEvent> {
+        let mut out = Vec::new();
+        let mut cur_x: Option<i32> = None;
+        let mut cur_y: Option<i32> = None;
+
+        for ev in raw_events {
+            match ev.event_type() {
+                EventType::KEY if ev.code() == Key::BTN_TOOL_FINGER.code() => {
+                    if ev.value() != 0 {
+                        self.finger_down = true;
+                        self.last_pos = None;
+                        out.push(TouchpadEvent::FingerDown);
+                    } else {
+                        self.finger_down = false;
+                        self.last_pos = None;
+                        out.push(TouchpadEvent::FingerUp);
+                    }
+                }
+                EventType::ABSOLUTE if self.finger_down => {
+                    match AbsoluteAxisType(ev.code()) {
+                        AbsoluteAxisType::ABS_X | AbsoluteAxisType::ABS_MT_POSITION_X => {
+                            cur_x = Some(ev.value());
+                        }
+                        AbsoluteAxisType::ABS_Y | AbsoluteAxisType::ABS_MT_POSITION_Y => {
+                            cur_y = Some(ev.value());
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Emit a position sample if we got any ABS data this batch
+        if self.finger_down && (cur_x.is_some() || cur_y.is_some()) {
+            let now = Instant::now();
+            let (dx, dy) = match self.last_pos {
+                Some((lx, ly)) => {
+                    (cur_x.unwrap_or(lx) - lx, cur_y.unwrap_or(ly) - ly)
+                }
+                None => (0, 0),
+            };
+
+            let pos = match self.last_pos {
+                Some((lx, ly)) => (cur_x.unwrap_or(lx), cur_y.unwrap_or(ly)),
+                None => (cur_x.unwrap_or(0), cur_y.unwrap_or(0)),
+            };
+            self.last_pos = Some(pos);
+
+            let displacement = ((dx * dx + dy * dy) as f64).sqrt();
+
+            out.push(TouchpadEvent::Position(Sample {
+                timestamp: now,
+                x: pos.0,
+                y: pos.1,
+                dx,
+                dy,
+                displacement,
+            }));
+        }
+
+        out
+    }
+}
+
+// =============================================================================
+// Layer 2: Activation algorithm — consumes samples, emits state transitions
+// =============================================================================
+
+/// State transitions emitted by an activation algorithm.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum GlideState {
     Active,
     Inactive,
 }
 
-/// Detects sustained touchpad motion using a rolling window of timestamped samples.
-struct MotionDetector {
-    finger_down: bool,
-    is_active: bool,
-    last_pos: Option<(i32, i32)>,
-    samples: VecDeque<(Instant, bool)>,
-    motion_threshold: i32,
-    activation_window: std::time::Duration,
-    activation_ratio: usize,
+/// An activation algorithm consumes touchpad events and decides
+/// when the touchpad is being intentionally used.
+trait ActivationAlgorithm {
+    fn on_finger_down(&mut self);
+    fn on_finger_up(&mut self) -> Option<GlideState>;
+    fn on_sample(&mut self, sample: &Sample) -> Option<GlideState>;
 }
 
-impl MotionDetector {
-    fn new(threshold: u16, window_ms: u64, ratio: u16) -> Self {
+/// Rolling window algorithm: counts motion-positive samples within a time
+/// window and activates when the ratio exceeds a threshold.
+struct RollingWindowAlgorithm {
+    is_active: bool,
+    motion_threshold_sq: i32,
+    activation_window: std::time::Duration,
+    activation_ratio: usize,
+    samples: VecDeque<(Instant, bool)>,
+}
+
+impl RollingWindowAlgorithm {
+    fn new(motion_threshold: u16, window_ms: u64, ratio: u16) -> Self {
+        let t = i32::from(motion_threshold);
         Self {
-            finger_down: false,
             is_active: false,
-            last_pos: None,
-            samples: VecDeque::with_capacity(64),
-            motion_threshold: i32::from(threshold),
+            motion_threshold_sq: t * t,
             activation_window: std::time::Duration::from_millis(window_ms),
             activation_ratio: ratio as usize,
+            samples: VecDeque::with_capacity(64),
         }
     }
 
     fn reset(&mut self) {
-        self.last_pos = None;
         self.samples.clear();
     }
 
-    fn finger_down(&mut self) {
-        self.finger_down = true;
+    fn check_activation(&mut self, now: Instant) -> bool {
+        let cutoff = now.checked_sub(self.activation_window).unwrap_or(now);
+        while self.samples.front().is_some_and(|(t, _)| *t < cutoff) {
+            self.samples.pop_front();
+        }
+
+        if self.samples.len() < 2 {
+            return false;
+        }
+
+        let oldest = self.samples.front().unwrap().0;
+        let margin = std::time::Duration::from_millis(20);
+        if now.duration_since(oldest) + margin < self.activation_window {
+            return false;
+        }
+
+        let total = self.samples.len();
+        let motion_count = self.samples.iter().filter(|(_, m)| *m).count();
+        let ratio = (motion_count * 100) / total;
+        ratio >= self.activation_ratio
+    }
+}
+
+impl ActivationAlgorithm for RollingWindowAlgorithm {
+    fn on_finger_down(&mut self) {
         self.reset();
     }
 
-    fn finger_up(&mut self) -> Option<GlideState> {
-        self.finger_down = false;
+    fn on_finger_up(&mut self) -> Option<GlideState> {
         self.reset();
         if self.is_active {
             self.is_active = false;
@@ -99,108 +232,27 @@ impl MotionDetector {
         }
     }
 
-    fn position_update(&mut self, x: Option<i32>, y: Option<i32>) -> SampleResult {
-        if !self.finger_down {
-            return SampleResult::Ignored;
-        }
-        if x.is_none() && y.is_none() {
-            return SampleResult::Ignored;
-        }
-
-        let now = Instant::now();
-
-        let (dx, dy, is_motion) = match self.last_pos {
-            None => (0, 0, false),
-            Some((lx, ly)) => {
-                let nx = x.unwrap_or(lx);
-                let ny = y.unwrap_or(ly);
-                let dx = nx - lx;
-                let dy = ny - ly;
-                let dist_sq = dx * dx + dy * dy;
-                (dx, dy, dist_sq >= self.motion_threshold * self.motion_threshold)
-            }
-        };
-
-        let pos = match self.last_pos {
-            Some((lx, ly)) => (x.unwrap_or(lx), y.unwrap_or(ly)),
-            None => (x.unwrap_or(0), y.unwrap_or(0)),
-        };
-        self.last_pos = Some(pos);
-
+    fn on_sample(&mut self, sample: &Sample) -> Option<GlideState> {
         if self.is_active {
-            return SampleResult::AlreadyActive;
+            return None;
         }
 
-        self.samples.push_back((now, is_motion));
+        let dist_sq = sample.dx * sample.dx + sample.dy * sample.dy;
+        let is_motion = dist_sq >= self.motion_threshold_sq;
+        self.samples.push_back((sample.timestamp, is_motion));
 
-        // Evict old samples
-        let cutoff = now.checked_sub(self.activation_window).unwrap_or(now);
-        while self.samples.front().is_some_and(|(t, _)| *t < cutoff) {
-            self.samples.pop_front();
-        }
-
-        let total = self.samples.len();
-        let motion_count = self.samples.iter().filter(|(_, m)| *m).count();
-        let ratio_pct = if total > 0 { (motion_count * 100) / total } else { 0 };
-
-        let disp = ((dx * dx + dy * dy) as f64).sqrt();
-
-        let sample = SampleInfo {
-            x: pos.0,
-            y: pos.1,
-            dx,
-            dy,
-            displacement: disp,
-            is_motion,
-            window_total: total,
-            window_motion: motion_count,
-            window_ratio_pct: ratio_pct,
-        };
-
-        // Check activation
-        let activated = if self.samples.len() >= 2 {
-            let oldest = self.samples.front().unwrap().0;
-            let margin = std::time::Duration::from_millis(20);
-            now.duration_since(oldest) + margin >= self.activation_window
-                && ratio_pct >= self.activation_ratio
-        } else {
-            false
-        };
-
-        if activated {
+        if self.check_activation(sample.timestamp) {
             self.is_active = true;
-            SampleResult::Activated(sample)
+            Some(GlideState::Active)
         } else {
-            SampleResult::Sample(sample)
+            None
         }
     }
 }
 
-/// Info about a single position sample, used for both detection and logging.
-#[derive(Debug)]
-struct SampleInfo {
-    x: i32,
-    y: i32,
-    dx: i32,
-    dy: i32,
-    displacement: f64,
-    is_motion: bool,
-    window_total: usize,
-    window_motion: usize,
-    window_ratio_pct: usize,
-}
-
-/// Result of processing a position update.
-enum SampleResult {
-    /// No position data or finger not down.
-    Ignored,
-    /// Already active, not sampling.
-    AlreadyActive,
-    /// Recorded a sample, not yet activated.
-    Sample(SampleInfo),
-    /// This sample triggered activation.
-    Activated(SampleInfo),
-}
+// =============================================================================
+// Layer 3: Backends — consume state transitions for external consumers
+// =============================================================================
 
 /// A backend receives glide state transitions and translates them
 /// into whatever the consumer expects.
@@ -236,7 +288,6 @@ impl KanataClient {
         }
         Ok(self.stream.as_mut().unwrap())
     }
-
 }
 
 impl Backend for KanataClient {
@@ -268,6 +319,10 @@ impl Backend for KanataClient {
     }
 }
 
+// =============================================================================
+// Main
+// =============================================================================
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -275,7 +330,6 @@ fn main() -> Result<()> {
 
     info!("glide starting");
     info!("device: {}", args.device);
-    info!("kanata: {} (virtual key: {})", args.kanata_address, args.virtual_key);
     info!(
         "detection: threshold={} window={}ms ratio={}%",
         args.motion_threshold, args.activation_window_ms, args.activation_ratio
@@ -289,35 +343,43 @@ fn main() -> Result<()> {
         device.name().unwrap_or("unknown")
     );
 
-    let mut detector = MotionDetector::new(
-        args.motion_threshold,
-        args.activation_window_ms,
-        args.activation_ratio,
+    let mut sampler = TouchpadSampler::new();
+
+    let mut algorithm: Box<dyn ActivationAlgorithm> = Box::new(
+        RollingWindowAlgorithm::new(
+            args.motion_threshold,
+            args.activation_window_ms,
+            args.activation_ratio,
+        ),
     );
 
     let log_samples = args.log_samples;
 
     let mut backend: Option<Box<dyn Backend>> = if log_samples {
         println!("# glide sample log");
-        println!("# threshold={} window={}ms ratio={}%", args.motion_threshold, args.activation_window_ms, args.activation_ratio);
-        println!("# Press Enter to insert a label, Ctrl+C to stop");
-        println!("# timestamp_ms, event, x, y, dx, dy, displacement, is_motion, window_total, window_motion, window_ratio_pct");
+        println!(
+            "# threshold={} window={}ms ratio={}%",
+            args.motion_threshold, args.activation_window_ms, args.activation_ratio
+        );
+        println!("# Ctrl+C to stop");
+        println!("# timestamp_ms, event, x, y, dx, dy, displacement");
         None
     } else {
-        Some(Box::new(KanataClient::new(args.kanata_address, args.virtual_key)))
+        info!(
+            "kanata: {} (virtual key: {})",
+            args.kanata_address, args.virtual_key
+        );
+        Some(Box::new(KanataClient::new(
+            args.kanata_address,
+            args.virtual_key,
+        )))
     };
 
     let start = Instant::now();
+    let ts = |now: Instant| now.duration_since(start).as_secs_f64() * 1000.0;
 
     loop {
-        // Check for label input (non-blocking) in log mode
-        if log_samples {
-            use std::io::BufRead;
-            // We can't easily do non-blocking stdin in this loop without async,
-            // so labels are entered between sessions via finger-up pauses.
-        }
-
-        let events: Vec<_> = match device.fetch_events() {
+        let raw_events: Vec<_> = match device.fetch_events() {
             Ok(evs) => evs.collect(),
             Err(e) => {
                 if e.raw_os_error() == Some(19) {
@@ -328,76 +390,55 @@ fn main() -> Result<()> {
             }
         };
 
-        let ts = || start.elapsed().as_secs_f64() * 1000.0;
-        let mut cur_x: Option<i32> = None;
-        let mut cur_y: Option<i32> = None;
-
-        for ev in &events {
-            match ev.event_type() {
-                EventType::KEY if ev.code() == Key::BTN_TOOL_FINGER.code() => {
-                    if ev.value() != 0 {
-                        detector.finger_down();
-                        if log_samples {
-                            println!("{:10.1}, FINGER_DOWN,,,,,,,,,,", ts());
-                        } else {
-                            debug!("finger down");
-                        }
+        for event in sampler.process_events(&raw_events) {
+            match event {
+                TouchpadEvent::FingerDown => {
+                    algorithm.on_finger_down();
+                    if log_samples {
+                        println!("{:10.1}, FINGER_DOWN, , , , , ", ts(Instant::now()));
                     } else {
-                        let was_active = detector.is_active;
-                        if let Some(state) = detector.finger_up() {
-                            if log_samples {
-                                println!("{:10.1}, FINGER_UP_DEACTIVATED,,,,,,,,,,", ts());
-                            } else {
-                                info!("finger up → {state:?}");
-                                backend.as_mut().unwrap().on_state_change(state);
-                            }
+                        debug!("finger down");
+                    }
+                }
+                TouchpadEvent::FingerUp => {
+                    if let Some(state) = algorithm.on_finger_up() {
+                        if log_samples {
+                            println!(
+                                "{:10.1}, FINGER_UP_DEACTIVATED, , , , , ",
+                                ts(Instant::now())
+                            );
                         } else {
-                            if log_samples {
-                                println!("{:10.1}, FINGER_UP,,,,,,,,,,", ts());
-                            } else {
-                                debug!("finger up (was not active)");
-                            }
+                            info!("finger up → {state:?}");
+                            backend.as_mut().unwrap().on_state_change(state);
                         }
+                    } else if log_samples {
+                        println!("{:10.1}, FINGER_UP, , , , , ", ts(Instant::now()));
+                    } else {
+                        debug!("finger up (was not active)");
                     }
                 }
-                EventType::ABSOLUTE if detector.finger_down => {
-                    match AbsoluteAxisType(ev.code()) {
-                        AbsoluteAxisType::ABS_X | AbsoluteAxisType::ABS_MT_POSITION_X => {
-                            cur_x = Some(ev.value());
-                        }
-                        AbsoluteAxisType::ABS_Y | AbsoluteAxisType::ABS_MT_POSITION_Y => {
-                            cur_y = Some(ev.value());
-                        }
-                        _ => {}
+                TouchpadEvent::Position(sample) => {
+                    if log_samples {
+                        let label = match algorithm.on_sample(&sample) {
+                            Some(GlideState::Active) => "ACTIVATED",
+                            _ => "SAMPLE",
+                        };
+                        println!(
+                            "{:10.1}, {}, {}, {}, {}, {}, {:.1}",
+                            ts(sample.timestamp),
+                            label,
+                            sample.x,
+                            sample.y,
+                            sample.dx,
+                            sample.dy,
+                            sample.displacement,
+                        );
+                    } else if let Some(GlideState::Active) = algorithm.on_sample(&sample) {
+                        info!("state change: Active");
+                        backend.as_mut().unwrap().on_state_change(GlideState::Active);
                     }
                 }
-                _ => {}
             }
-        }
-
-        match detector.position_update(cur_x, cur_y) {
-            SampleResult::Activated(s) => {
-                if log_samples {
-                    println!(
-                        "{:10.1}, ACTIVATED, {}, {}, {}, {}, {:.1}, {}, {}, {}, {}",
-                        ts(), s.x, s.y, s.dx, s.dy, s.displacement,
-                        s.is_motion, s.window_total, s.window_motion, s.window_ratio_pct,
-                    );
-                } else {
-                    info!("state change: Active");
-                    backend.as_mut().unwrap().on_state_change(GlideState::Active);
-                }
-            }
-            SampleResult::Sample(s) => {
-                if log_samples {
-                    println!(
-                        "{:10.1}, SAMPLE, {}, {}, {}, {}, {:.1}, {}, {}, {}, {}",
-                        ts(), s.x, s.y, s.dx, s.dy, s.displacement,
-                        s.is_motion, s.window_total, s.window_motion, s.window_ratio_pct,
-                    );
-                }
-            }
-            SampleResult::Ignored | SampleResult::AlreadyActive => {}
         }
     }
 }
