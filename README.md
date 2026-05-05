@@ -1,6 +1,6 @@
 # Glide
 
-Touchpad motion detection daemon that turns your touchpad into a modifier key. Touch the pad and move your finger — keys remap. Lift your finger — back to normal.
+More accurate touchpad event monitoring for Linux, which makes applications like using the touchpad as a modifier key and specific gestures practical.
 
 Glide detects intentional touchpad use and sends activation signals to [kanata](https://github.com/jtroo/kanata) over TCP, pressing a virtual key that triggers a layer switch. No touchpad grab, no cursor interference, no libinput dependency.
 
